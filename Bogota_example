@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from skfda.representation.grid import FDataGrid
+from skfda.preprocessing.smoothing import BasisSmoother
+from skfda.representation.basis import FourierBasis
+from scipy.stats import pearsonr
+import warnings
+
+# Load WRF output data
+wrf_df = pd.read_csv('output/wrf_output_data.csv', parse_dates=['Time'], encoding='ISO-8859-1')
+
+# Load observation data
+obs_df = pd.read_csv('output/ObsBog26Jan00to12.csv', parse_dates=['Time'], encoding='ISO-8859-1')
+
+# Merge data on the 'Time' column to ensure alignment
+merged_df = pd.merge(wrf_df, obs_df, on='Time', suffixes=('_wrf', '_obs'))
+
+# Define a function to perform FDA smoothing
+def smooth_data(data):
+    data = data.flatten()  # Ensure data is a 1D array
+    grid_points = np.arange(len(data))  # Create grid points as indices
+    data_matrix = data.reshape(1, -1)  # Ensure data_matrix is a 2D array with shape (1, n_samples)
+    
+    fd = FDataGrid(data_matrix, grid_points)
+    
+    # Use BasisSmoother with a Fourier basis for FDA smoothing
+    basis = FourierBasis(n_basis=5)  # You can adjust the number of basis functions
+    smoother = BasisSmoother(basis)
+    fd_smooth = smoother.fit_transform(fd)
+    
+    return fd_smooth.data_matrix.flatten()
+
+# Apply FDA smoothing to the WRF and observation data
+merged_df['Temperature (°C)_wrf_smoothed'] = smooth_data(merged_df['Temperature (°C)_wrf'].values)
+merged_df['Temperature (°C)_obs_smoothed'] = smooth_data(merged_df['Temperature (°C)_obs'].values)
+
+merged_df['Wind Speed (m/s)_wrf_smoothed'] = smooth_data(merged_df['Wind Speed (m/s)_wrf'].values)
+merged_df['Wind Speed (m/s)_obs_smoothed'] = smooth_data(merged_df['Wind Speed (m/s)_obs'].values)
+
+merged_df['Wind Direction (°)_wrf_smoothed'] = smooth_data(merged_df['Wind Direction (°)_wrf'].values)
+merged_df['Wind Direction (°)_obs_smoothed'] = smooth_data(merged_df['Wind Direction (°)_obs'].values)
+
+# Define functions for statistical metrics
+def mean_fractional_bias(wrf_data, obs_data):
+    return 2 * np.mean((wrf_data - obs_data) / (wrf_data + obs_data)) * 100
+
+def rmse(wrf_data, obs_data):
+    return np.sqrt(np.mean((wrf_data - obs_data) ** 2))
+
+# Calculate MFB for Temperature, Wind Speed, and Wind Direction
+mfb_temp = mean_fractional_bias(merged_df['Temperature (°C)_wrf_smoothed'], merged_df['Temperature (°C)_obs_smoothed'])
+mfb_wind_speed = mean_fractional_bias(merged_df['Wind Speed (m/s)_wrf_smoothed'], merged_df['Wind Speed (m/s)_obs_smoothed'])
+mfb_wind_direction = mean_fractional_bias(merged_df['Wind Direction (°)_wrf_smoothed'], merged_df['Wind Direction (°)_obs_smoothed'])
+
+# Display the MFB values
+print(f"MFB (Temperature): {mfb_temp:.2f}%")
+print(f"MFB (Wind Speed): {mfb_wind_speed:.2f}%")
+print(f"MFB (Wind Direction): {mfb_wind_direction:.2f}%")
+
+# Calculate RMSE for Temperature, Wind Speed, and Wind Direction
+rmse_temp = rmse(merged_df['Temperature (°C)_wrf_smoothed'], merged_df['Temperature (°C)_obs_smoothed'])
+rmse_wind_speed = rmse(merged_df['Wind Speed (m/s)_wrf_smoothed'], merged_df['Wind Speed (m/s)_obs_smoothed'])
+rmse_wind_direction = rmse(merged_df['Wind Direction (°)_wrf_smoothed'], merged_df['Wind Direction (°)_obs_smoothed'])
+
+# Display the RMSE values
+print(f"RMSE (Temperature): {rmse_temp:.2f}")
+print(f"RMSE (Wind Speed): {rmse_wind_speed:.2f}")
+print(f"RMSE (Wind Direction): {rmse_wind_direction:.2f}")
+
+# Suppress ConstantInputWarning
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+
+# Calculate Pearson's Correlation Coefficient for smoothed Temperature, Wind Speed, and Wind Direction
+corr_temp, _ = pearsonr(merged_df['Temperature (°C)_wrf_smoothed'], merged_df['Temperature (°C)_obs_smoothed'])
+corr_wind_speed, _ = pearsonr(merged_df['Wind Speed (m/s)_wrf_smoothed'], merged_df['Wind Speed (m/s)_obs_smoothed'])
+corr_wind_direction, _ = pearsonr(merged_df['Wind Direction (°)_wrf_smoothed'], merged_df['Wind Direction (°)_obs_smoothed'])
+
+# Display the correlation coefficients
+print(f"Pearson's Correlation Coefficient (Temperature): {corr_temp:.2f}")
+print(f"Pearson's Correlation Coefficient (Wind Speed): {corr_wind_speed:.2f}")
+print(f"Pearson's Correlation Coefficient (Wind Direction): {corr_wind_direction:.2f}")
+
+# Plot smoothed temperature data
+plt.figure(figsize=(12, 6))
+plt.plot(merged_df['Time'], merged_df['Temperature (°C)_wrf_smoothed'], label='WRF Temperature (Smoothed)', color='blue')
+plt.plot(merged_df['Time'], merged_df['Temperature (°C)_obs_smoothed'], label='Observed Temperature (Smoothed)', color='red')
+plt.xlabel('Time')
+plt.ylabel('Temperature (°C)')
+plt.title('Smoothed Temperature Comparison')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Plot smoothed wind speed data
+plt.figure(figsize=(12, 6))
+plt.plot(merged_df['Time'], merged_df['Wind Speed (m/s)_wrf_smoothed'], label='WRF Wind Speed (Smoothed)', color='blue')
+plt.plot(merged_df['Time'], merged_df['Wind Speed (m/s)_obs_smoothed'], label='Observed Wind Speed (Smoothed)', color='red')
+plt.xlabel('Time')
+plt.ylabel('Wind Speed (m/s)')
+plt.title('Smoothed Wind Speed Comparison')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Plot smoothed wind direction data
+plt.figure(figsize=(12, 6))
+plt.plot(merged_df['Time'], merged_df['Wind Direction (°)_wrf_smoothed'], label='WRF Wind Direction (Smoothed)', color='blue')
+plt.plot(merged_df['Time'], merged_df['Wind Direction (°)_obs_smoothed'], label='Observed Wind Direction (Smoothed)', color='red')
+plt.xlabel('Time')
+plt.ylabel('Wind Direction (°)')
+plt.title('Smoothed Wind Direction Comparison')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Data for plotting MFB and RMSE
+variables = ['Temperature', 'Wind Speed', 'Wind Direction']
+mfb_values = [mfb_temp, mfb_wind_speed, mfb_wind_direction]
+rmse_values = [rmse_temp, rmse_wind_speed, rmse_wind_direction]
+
+# Bar plot for MFB
+plt.figure(figsize=(10, 6))
+plt.bar(variables, mfb_values, color=['blue', 'red', 'green'])
+plt.xlabel('Variables')
+plt.ylabel('Mean Fractional Bias (%)')
+plt.title('Mean Fractional Bias (MFB) for Temperature, Wind Speed, and Wind Direction')
+plt.grid(True, axis='y')
+for i, v in enumerate(mfb_values):
+    plt.text(i, v + 0.5, f"{v:.2f}%", ha='center', va='bottom')
+plt.show()
+
+# Bar plot for RMSE
+plt.figure(figsize=(10, 6))
+plt.bar(variables, rmse_values, color=['blue', 'red', 'green'])
+plt.xlabel('Variables')
+plt.ylabel('Root Mean Square Error (RMSE)')
+plt.title('Root Mean Square Error (RMSE) for Temperature, Wind Speed, and Wind Direction')
+plt.grid(True, axis='y')
+for i, v in enumerate(rmse_values):
+    plt.text(i, v + 0.05, f"{v:.2f}", ha='center', va='bottom')
+plt.show()
+
+# Scatter plots for correlation
+fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+
+# Scatter plot for temperature
+ax[0].scatter(merged_df['Temperature (°C)_obs_smoothed'], merged_df['Temperature (°C)_wrf_smoothed'], color='blue')
+ax[0].set_xlabel('Observed Temperature (°C)')
+ax[0].set_ylabel('WRF Temperature (°C)')
+ax[0].set_title("Pearson's Correlation: {:.2f}".format(corr_temp))
+ax[0].grid(True)
+
+# Scatter plot for wind speed
+ax[1].scatter(merged_df['Wind Speed (m/s)_obs_smoothed'], merged_df['Wind Speed (m/s)_wrf_smoothed'], color='red')
+ax[1].set_xlabel('Observed Wind Speed (m/s)')
+ax[1].set_ylabel('WRF Wind Speed (m/s)')
+ax[1].set_title("Pearson's Correlation: {:.2f}".format(corr_wind_speed))
+ax[1].grid(True)
+
+# Scatter plot for wind direction
+ax[2].scatter(merged_df['Wind Direction (°)_obs_smoothed'], merged_df['Wind Direction (°)_wrf_smoothed'], color='green')
+ax[2].set_xlabel('Observed Wind Direction (°)')
+ax[2].set_ylabel('WRF Wind Direction (°)')
+ax[2].set_title("Pearson's Correlation: {:.2f}".format(corr_wind_direction))
+ax[2].grid(True)
+
+plt.suptitle('Correlation Scatter Plots')
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.show()
