@@ -155,6 +155,10 @@ for city, data in cities.items():
             metrics.append({'Variable': var, 'Metric': 'MFB', 'Value': mfb})
             metrics.append({'Variable': var, 'Metric': 'RMSE', 'Value': rmse_val})
             metrics.append({'Variable': var, 'Metric': 'Pearson Correlation', 'Value': corr})
+            print(f"Metrics for {var} in {city} during {time_frame[0]}:")
+            print(f"Mean Fractional Bias (MFB): {mfb:.2f}%")
+            print(f"Root Mean Square Error (RMSE): {rmse_val:.2f}")
+            print(f"Pearson Correlation: {corr:.2f}\n")
         
         metrics_df = pd.DataFrame(metrics)
         
