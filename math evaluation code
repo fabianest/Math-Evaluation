@@ -1,0 +1,164 @@
+import os
+import pandas as pd
+import numpy as np
+from netCDF4 import Dataset
+from datetime import datetime
+from skfda.representation.grid import FDataGrid
+from skfda.preprocessing.smoothing import BasisSmoother
+from skfda.representation.basis import FourierBasis
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.spatial import cKDTree
+
+# Define city names, coordinates, and time frames
+cities = {
+    "Bogota": {"coords": (4.8123, -74.0649), "time_frames": [
+        ("Jan 7th to Jan 26th 2019", "2019-01-07", "2019-01-26"),
+    ]}
+}
+
+# Define paths
+base_dir = "WRF_Bogota_1/"
+obs_dir = "Obs_Bogota_1/"
+output_dir = "Output_Bogota_1/"
+
+# Function to find the nearest grid point
+def find_nearest_grid_point(lat, lon, lats, lons):
+    tree = cKDTree(list(zip(lats.flatten(), lons.flatten())))
+    dist, idx = tree.query([lat, lon])
+    return np.unravel_index(idx, lats.shape)
+
+# Function to extract data from netCDF files
+def extract_data_from_nc(file_path, variable, lat_idx, lon_idx):
+    with Dataset(file_path, 'r') as nc:
+        var_data = nc.variables[variable][:, lat_idx, lon_idx]
+        times = nc.variables['Times'][:]
+        times = [b''.join(t).decode('utf-8') for t in times]  # Decode byte strings
+        times = [datetime.strptime(t, '%Y-%m-%d_%H:%M:%S') for t in times]
+    return times, var_data
+
+# Function to get hourly data
+def get_hourly_data(times, var_data):
+    df = pd.DataFrame({'Time': times, 'Value': var_data})
+    df['Time'] = pd.to_datetime(df['Time'])  # Convert string dates to datetime
+    df = df.set_index('Time').resample('H').mean().reset_index()
+    return df
+
+# Function to smooth data using Fourier basis
+def smooth_data(data, period=24):
+    basis = FourierBasis(n_basis=5, period=period)
+    fd = FDataGrid(data, sample_points=np.arange(len(data)))
+    smoother = BasisSmoother(basis)
+    fd_smooth = smoother.fit_transform(fd)
+    fd_smooth = smoother.fit_transform(fd)
+    return fd_smooth.data_matrix.flatten()
+
+# Function to calculate metrics
+def calculate_metrics(df, variable):
+    obs = df[f'{variable}_obs_smoothed']
+    wrf = df[f'{variable}_wrf_smoothed']
+    mfb = (2 * (wrf - obs) / (wrf + obs)).mean() * 100
+    rmse_val = np.sqrt(((wrf - obs) ** 2).mean())
+    corr, _ = pearsonr(wrf, obs)
+    return mfb, rmse_val, corr
+
+# Function to plot metrics
+def plot_metrics(metrics_df, city, time_frame):
+    plt.figure(figsize=(12, 6))
+    sns.scatterplot(data=metrics_df, x='Variable', y='Value', hue='Metric', style='Metric', s=100)
+    plt.title(f'Metrics for {city} ({time_frame})')
+    plt.ylabel('Value')
+    plt.grid(True)
+    plt.show()
+
+# Function to plot comparison
+def plot_comparison(df, city, time_frame, variable):
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['Time'], df[f'{variable}_obs_smoothed'], label='Observed', color='blue')
+    plt.plot(df['Time'], df[f'{variable}_wrf_smoothed'], label='WRF', color='red', linestyle='--')
+    plt.title(f'{variable} Comparison for {city} ({time_frame})')
+    plt.xlabel('Time')
+    plt.ylabel(variable)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Main script
+for city, data in cities.items():
+    lat, lon = data["coords"]
+    for time_frame in data["time_frames"]:
+        print(f"Processing {city} for {time_frame[0]}...")
+        
+        # Define paths
+        simulation_folder = os.path.join(base_dir, city, time_frame[0].replace(' ', '_'))
+        observation_file = os.path.join(obs_dir, f'Obs_{city}_{time_frame[0].replace(" ", "_")}.csv')
+        
+        # Check if observation file exists
+        if not os.path.isfile(observation_file):
+            print(f"Observation file not found: {observation_file}")
+            continue
+        
+        # Load observation data
+        obs_df = pd.read_csv(observation_file, parse_dates=['Time'], encoding='ISO-8859-1')
+        
+        # Standardize column names in observation data
+        obs_df.columns = [col.strip() for col in obs_df.columns]
+        obs_column_map = {
+            'Temperature (°C)': 'Temperature (°C)_obs',
+            'Wind Speed (m/s)': 'Wind Speed (m/s)_obs',
+            'Wind Direction (°)': 'Wind Direction (°)_obs'
+        }
+        obs_df = obs_df.rename(columns=obs_column_map)
+        
+        # Extract coordinates from the first .nc file to find the nearest grid point
+        sample_file = os.path.join(simulation_folder, os.listdir(simulation_folder)[0])
+        with Dataset(sample_file, 'r') as nc:
+            lats = nc.variables['XLAT'][0, :, :]
+            lons = nc.variables['XLONG'][0, :, :]
+        
+        lat_idx, lon_idx = find_nearest_grid_point(lat, lon, lats, lons)
+        
+        # Extract and process simulation data
+        times, temp_data, wind_speed_data, wind_direction_data = [], [], [], []
+        for file in os.listdir(simulation_folder):
+            file_path = os.path.join(simulation_folder, file)
+            t, temp = extract_data_from_nc(file_path, 'T2', lat_idx, lon_idx)
+            _, wind_u = extract_data_from_nc(file_path, 'U10', lat_idx, lon_idx)
+            _, wind_v = extract_data_from_nc(file_path, 'V10', lat_idx, lon_idx)
+            times.extend(t)
+            temp_data.extend(temp)
+            wind_speed_data.extend(np.sqrt(wind_u**2 + wind_v**2))  # Calculate wind speed magnitude
+            wind_direction_data.extend(np.degrees(np.arctan2(wind_v, wind_u)))  # Convert wind direction
+            
+        wrf_df = pd.DataFrame({'Time': times, 'Temperature (°C)_wrf': temp_data, 'Wind Speed (m/s)_wrf': wind_speed_data, 'Wind Direction (°)_wrf': wind_direction_data})
+        wrf_df['Time'] = pd.to_datetime(wrf_df['Time'])  # Convert string dates to datetime
+        
+        # Resample to hourly data
+        wrf_df = wrf_df.set_index('Time').resample('H').mean().reset_index()
+        
+        # Merge with observation data
+        merged_df = pd.merge(wrf_df, obs_df, on='Time', suffixes=('_wrf', '_obs'))
+        
+        # Convert temperature from Kelvin to Celsius
+        merged_df['Temperature (°C)_wrf'] -= 273.15
+        
+        # Smooth data
+        for var in ['Temperature (°C)', 'Wind Speed (m/s)', 'Wind Direction (°)']:
+            merged_df[f'{var}_wrf_smoothed'] = smooth_data(merged_df[f'{var}_wrf'].values)
+            merged_df[f'{var}_obs_smoothed'] = smooth_data(merged_df[f'{var}_obs'].values)
+        
+        # Calculate metrics
+        metrics = []
+        for var in ['Temperature (°C)', 'Wind Speed (m/s)', 'Wind Direction (°)']:
+            mfb, rmse_val, corr = calculate_metrics(merged_df, var)
+            metrics.append({'Variable': var, 'Metric': 'MFB', 'Value': mfb})
+            metrics.append({'Variable': var, 'Metric': 'RMSE', 'Value': rmse_val})
+            metrics.append({'Variable': var, 'Metric': 'Pearson Correlation', 'Value': corr})
+        
+        metrics_df = pd.DataFrame(metrics)
+        
+        # Plot metrics and comparisons
+        plot_metrics(metrics_df, city, time_frame[0])
+        for var in ['Temperature (°C)', 'Wind Speed (m/s)', 'Wind Direction (°)']:
+            plot_comparison(merged_df, city, time_frame[0], var)
