@@ -1,0 +1,314 @@
+import pandas as pd
+import numpy as np
+from skfda.representation.grid import FDataGrid
+from skfda.representation.basis import BSplineBasis
+from skfda.preprocessing.smoothing import BasisSmoother
+from skfda.exploratory.depth import ModifiedBandDepth
+from skfda.misc.metrics import lp_distance
+from scipy.stats import kendalltau
+
+# Load the modified CSV file with 'Location' column
+df = pd.read_csv('cali2_wrf_fda_updated_with_location.csv')
+
+# Filter the data until row 114913 (up to 4/5/2019 23:00)
+df_filtered = df.iloc[:114914]
+
+# Cross-validation for optimal number of B-spline basis functions
+def cross_validate_spline_basis(fdata, min_k=4, max_k=15):  
+    best_k = None
+    best_score = float('inf')
+    scores = []
+
+    for k in range(min_k, max_k + 1):
+        basis = BSplineBasis(n_basis=k)
+        smoother = BasisSmoother(basis)
+        smoothed_data = smoother.fit_transform(fdata)
+
+        # Compute cross-validation score (L2 norm in this case)
+        l2_error = np.mean((fdata.data_matrix - smoothed_data.data_matrix) ** 2)
+        scores.append((k, l2_error))
+
+        if l2_error < best_score:
+            best_score = l2_error
+            best_k = k
+
+    # Print analyzed K values and corresponding L2 errors
+    for k, score in scores:
+        print(f"B-spline basis (K={k}), Cross-validation L2 error: {score}")
+
+    return best_k
+
+# Define the FDA processing function with depth measurement and evaluation
+def process_fda_with_depth_clustering(df, var_name, y_label):
+    df = df.copy()  
+    df['HoursSinceStart'] = np.arange(len(df)) // 684  # Create a time reference
+    time_points = df['HoursSinceStart'].unique()
+    valid_time_points = time_points[:168]  # Adjust time points to match non-missing data
+
+    # Pivot the dataframe to get curves (rows for each location, columns for time)
+    curves = df.pivot(index='HoursSinceStart', columns='Location', values=var_name).values
+    curves = curves[~np.isnan(curves).any(axis=1)]  # Remove NaNs
+
+    # Convert to FDataGrid for smoothing
+    fdata = FDataGrid(curves.T, valid_time_points)
+
+    # Apply cross-validation to find the optimal K for B-spline basis
+    optimal_k = cross_validate_spline_basis(fdata)
+    print(f"\nOptimal number of B-spline basis functions (K): {optimal_k}")
+
+    # Apply smoothing using the best K found
+    basis = BSplineBasis(n_basis=optimal_k)
+    smoother = BasisSmoother(basis)
+    smoothed_data = smoother.fit_transform(fdata)
+
+    # Calculate depth measurements manually
+    depth_mbd = ModifiedBandDepth().fit(smoothed_data).transform(smoothed_data)
+    depth_mean = smoothed_data.data_matrix.mean(axis=0)  # Mean of all curves
+    depth_hypograph = 1 / (1 + lp_distance(smoothed_data, smoothed_data.mean(axis=0), p=2))
+
+    # Mean smoothed data across all curves (for comparison)
+    overall_mean_curve = smoothed_data.data_matrix.mean(axis=0)
+
+    # Initialize best metrics
+    best_metrics = {
+        'Modified Band Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')},
+        'Mean Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')},
+        'Hypograph Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')}
+    }
+
+    # Function to compute metrics for a given depth measurement
+    def evaluate_depth_methods(smoothed_data, depth_values, depth_name, reference_curve):
+        l2_distances, mfbs, kendall_taus = [], [], []
+
+        for i in range(smoothed_data.data_matrix.shape[0]):
+            # L2 Norm
+            l2 = np.linalg.norm(reference_curve - smoothed_data.data_matrix[i])
+            # MFB
+            mfb = np.mean((reference_curve - smoothed_data.data_matrix[i]) / (0.5 * (reference_curve + smoothed_data.data_matrix[i])))
+            # Kendall's tau
+            kendall_tau = kendalltau(reference_curve, smoothed_data.data_matrix[i])[0]
+
+            l2_distances.append(l2)
+            mfbs.append(mfb)
+            kendall_taus.append(kendall_tau)
+
+            # Update best metrics for this depth method
+            if l2 < best_metrics[depth_name]['L2']:
+                best_metrics[depth_name]['L2'] = l2
+            if mfb < best_metrics[depth_name]['MFB']:
+                best_metrics[depth_name]['MFB'] = mfb
+            if kendall_tau < best_metrics[depth_name]['Kendall']:
+                best_metrics[depth_name]['Kendall'] = kendall_tau
+
+        return np.array(l2_distances), np.array(mfbs), np.array(kendall_taus)
+
+    # Evaluate depth methods
+    # For Modified Band Depth, compare to the curve with the highest depth score
+    reference_curve_mbd = smoothed_data.data_matrix[np.argmax(depth_mbd)]
+    l2_mbd, mfb_mbd, kendall_mbd = evaluate_depth_methods(smoothed_data, depth_mbd, 'Modified Band Depth', reference_curve_mbd)
+
+    # For Mean Depth, compare to the overall mean curve (not to itself)
+    l2_mean, mfb_mean, kendall_mean = evaluate_depth_methods(smoothed_data, depth_mean, 'Mean Depth', overall_mean_curve)
+
+    # For Hypograph Depth, compare to the curve with the highest hypograph depth score
+    reference_curve_hypograph = smoothed_data.data_matrix[np.argmax(depth_hypograph)]
+    l2_hypograph, mfb_hypograph, kendall_hypograph = evaluate_depth_methods(smoothed_data, depth_hypograph, 'Hypograph Depth', reference_curve_hypograph)
+
+    # Print best metrics for each depth method
+    for depth_name, metrics in best_metrics.items():
+        print(f"\nBest metrics for {depth_name}:")
+        print(f"L2 Norm = {metrics['L2']}, MFB = {metrics['MFB']}, Kendall’s tau = {metrics['Kendall']}")
+
+    # Determine the most representative curve based on the depth measurement with the best L2 norm
+    best_depth_method = min(best_metrics.keys(), key=lambda k: best_metrics[k]['L2'])
+    print(f"\nThe best depth measurement method is: {best_depth_method}")
+
+# Apply to the variables
+process_fda_with_depth_clustering(df_filtered, 'Temperature', 'Temperature (°C)')
+process_fda_with_depth_clustering(df_filtered, 'WindSpeed', 'Wind Speed (m/s)')
+process_fda_with_depth_clustering(df_filtered, 'WindDirection', 'Wind Direction (degrees)')
+
+
+
+  # The following script is for choosing the number of K-medoids using the Silhouette score method:
+
+import pandas as pd
+import numpy as np
+from skfda.representation.grid import FDataGrid
+from skfda.representation.basis import BSplineBasis
+from skfda.preprocessing.smoothing import BasisSmoother
+from skfda.exploratory.depth import ModifiedBandDepth
+from sklearn_extra.cluster import KMedoids
+from skfda.misc.metrics import lp_distance
+from sklearn.metrics import silhouette_score
+from scipy.stats import kendalltau
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# Load the modified CSV file with 'Location' column
+df = pd.read_csv('cali2_wrf_fda_updated_with_location.csv')
+
+# Filter the data until row 114913 (up to 4/5/2019 23:00)
+df_filtered = df.iloc[:114914]
+
+# Cross-validation for optimal number of B-spline basis functions
+def cross_validate_spline_basis(fdata, min_k=4, max_k=15):  
+    best_k = None
+    best_score = float('inf')
+    scores = []
+
+    for k in range(min_k, max_k + 1):
+        basis = BSplineBasis(n_basis=k)
+        smoother = BasisSmoother(basis)
+        smoothed_data = smoother.fit_transform(fdata)
+
+        # Compute cross-validation score (L2 norm in this case)
+        l2_error = np.mean((fdata.data_matrix - smoothed_data.data_matrix) ** 2)
+        scores.append((k, l2_error))
+
+        if l2_error < best_score:
+            best_score = l2_error
+            best_k = k
+
+    # Print analyzed K values and corresponding L2 errors
+    for k, score in scores:
+        print(f"B-spline basis (K={k}), Cross-validation L2 error: {score}")
+
+    return best_k
+
+# Define the FDA processing function with depth measurement and K-medoids
+def process_fda_with_depth_clustering(df, var_name, y_label, n_clusters_range=(2, 10)):
+    df = df.copy()  
+    df['HoursSinceStart'] = np.arange(len(df)) // 684  # Create a time reference
+    time_points = df['HoursSinceStart'].unique()
+    valid_time_points = time_points[:168]  # Adjust time points to match non-missing data
+
+    # Convert hours to dates for the x-axis
+    start_date = pd.to_datetime('2019-03-30 00:00')
+    date_range = pd.date_range(start=start_date, periods=len(valid_time_points), freq='H')
+
+    # Pivot the dataframe to get curves (rows for each location, columns for time)
+    curves = df.pivot(index='HoursSinceStart', columns='Location', values=var_name).values
+    curves = curves[~np.isnan(curves).any(axis=1)]  # Remove NaNs
+
+    # Convert to FDataGrid for smoothing
+    fdata = FDataGrid(curves.T, valid_time_points)
+
+    # Apply cross-validation to find the optimal K for B-spline basis
+    optimal_k = cross_validate_spline_basis(fdata)
+    print(f"\nOptimal number of B-spline basis functions (K): {optimal_k}")
+
+    # Apply smoothing using the best K found
+    basis = BSplineBasis(n_basis=optimal_k)
+    smoother = BasisSmoother(basis)
+    smoothed_data = smoother.fit_transform(fdata)
+
+    # Calculate depth measurements manually
+    depth_mbd = ModifiedBandDepth().fit(smoothed_data).transform(smoothed_data)
+    depth_mean = np.mean(lp_distance(smoothed_data, smoothed_data.mean(axis=0), p=2), axis=0)
+    depth_hypograph = 1 / (1 + lp_distance(smoothed_data, smoothed_data.mean(axis=0), p=2))
+
+    # Mean smoothed data across all curves
+    mean_smoothed = smoothed_data.data_matrix.mean(axis=0)
+
+    # Initialize best metrics
+    best_metrics = {
+        'Modified Band Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')},
+        'Mean Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')},
+        'Hypograph Depth': {'L2': float('inf'), 'MFB': float('inf'), 'Kendall': float('inf')}
+    }
+
+    # Evaluate depth methods and update best metrics
+    def evaluate_depth_methods(smoothed_data, depth_values, depth_name):
+        l2_distances, mfbs, kendall_taus = [], [], []
+
+        for i in range(smoothed_data.data_matrix.shape[0]):
+            l2 = np.linalg.norm(mean_smoothed - smoothed_data.data_matrix[i])
+            mfb = np.mean((mean_smoothed - smoothed_data.data_matrix[i]) / (0.5 * (mean_smoothed + smoothed_data.data_matrix[i])))
+            kendall_tau = kendalltau(mean_smoothed, smoothed_data.data_matrix[i])[0]
+
+            l2_distances.append(l2)
+            mfbs.append(mfb)
+            kendall_taus.append(kendall_tau)
+
+            if l2 < best_metrics[depth_name]['L2']:
+                best_metrics[depth_name]['L2'] = l2
+            if mfb < best_metrics[depth_name]['MFB']:
+                best_metrics[depth_name]['MFB'] = mfb
+            if kendall_tau < best_metrics[depth_name]['Kendall']:
+                best_metrics[depth_name]['Kendall'] = kendall_tau
+
+        return np.array(l2_distances), np.array(mfbs), np.array(kendall_taus)
+
+    # Evaluate depth methods
+    l2_mbd, mfb_mbd, kendall_mbd = evaluate_depth_methods(smoothed_data, depth_mbd, 'Modified Band Depth')
+    l2_mean, mfb_mean, kendall_mean = evaluate_depth_methods(smoothed_data, depth_mean, 'Mean Depth')
+    l2_hypograph, mfb_hypograph, kendall_hypograph = evaluate_depth_methods(smoothed_data, depth_hypograph, 'Hypograph Depth')
+
+    # Print best metrics for each depth method
+    for depth_name, metrics in best_metrics.items():
+        print(f"\nBest metrics for {depth_name}:")
+        print(f"L2 Norm = {metrics['L2']}, MFB = {metrics['MFB']}, Kendall’s tau = {metrics['Kendall']}")
+
+    # Determine the most representative curve based on the depth measurement with the best L2 norm
+    best_depth_method = min(best_metrics.keys(), key=lambda k: best_metrics[k]['L2'])
+    print(f"\nThe best depth measurement method is: {best_depth_method}")
+
+    # K-medoids clustering with Silhouette score analysis
+    best_silhouette_score = -1
+    best_k_medoids = None
+    silhouette_scores = []
+
+    for n_clusters in range(n_clusters_range[0], n_clusters_range[1] + 1):
+        kmedoids = KMedoids(n_clusters=n_clusters, random_state=0)
+        cluster_labels = kmedoids.fit_predict(smoothed_data.data_matrix.squeeze())
+        silhouette_avg = silhouette_score(smoothed_data.data_matrix.squeeze(), cluster_labels)
+        silhouette_scores.append((n_clusters, silhouette_avg))
+
+        if silhouette_avg > best_silhouette_score:
+            best_silhouette_score = silhouette_avg
+            best_k_medoids = n_clusters
+
+    # Print analyzed K-medoids and corresponding Silhouette scores
+    print("\nK-medoids clustering analysis:")
+    for n_clusters, score in silhouette_scores:
+        print(f"K-medoids (K={n_clusters}), Silhouette score: {score}")
+
+    print(f"\nOptimal number of K-medoids: {best_k_medoids}")
+
+    # Plot the smoothed data
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap('tab20')  
+
+    for i, curve in enumerate(smoothed_data.data_matrix):
+        color = cmap(i % cmap.N)  
+        plt.plot(date_range, curve, alpha=0.5, color=color, label=f'Location {i + 1}' if i < 20 else '')
+
+    # Highlight the most representative curve from the best depth measurement
+    representative_curve_index = None
+    if best_depth_method == 'Modified Band Depth':
+        representative_curve_index = np.argmax(depth_mbd)
+    elif best_depth_method == 'Mean Depth':
+        representative_curve_index = np.argmax(depth_mean)
+    else:  # Hypograph Depth
+        representative_curve_index = np.argmax(depth_hypograph)
+
+    plt.plot(date_range, smoothed_data.data_matrix[representative_curve_index], color='black', linewidth=2, label='Most Representative Curve')
+
+    # Highlight the medoids of each cluster with unique colors
+    kmedoids = KMedoids(n_clusters=best_k_medoids, random_state=0)
+    kmedoids.fit(smoothed_data.data_matrix.squeeze())
+    for idx, medoid_idx in enumerate(kmedoids.medoid_indices_):
+        plt.plot(date_range, smoothed_data.data_matrix[medoid_idx], color=cmap(idx % cmap.N), linestyle='--', linewidth=2, label=f'K-medoid {medoid_idx + 1}')
+
+    plt.xlabel('Date')
+    plt.ylabel(y_label)
+    plt.title(f'{var_name} Comparison with Smoothed Curves')
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    plt.xticks(rotation=45)
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), ncol=1)
+    plt.tight_layout()
+    plt.show()
+
+# Example usage for Temperature
+process_fda_with_depth_clustering(df_filtered, 'Temperature', 'Temperature (°C)')
