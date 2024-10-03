@@ -1,0 +1,186 @@
+import pandas as pd
+import numpy as np
+from skfda.representation.grid import FDataGrid
+from skfda.representation.basis import BSplineBasis
+from skfda.preprocessing.smoothing import BasisSmoother
+from skfda.exploratory.depth import ModifiedBandDepth
+from sklearn_extra.cluster import KMedoids
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from sklearn.metrics import mean_squared_error
+from scipy.stats import pearsonr
+from skfda.misc.metrics import lp_distance
+
+# Load the simulation data
+df = pd.read_csv('medellin2_wrf_fda_updated_with_location.csv')
+
+# Filter the data until row 114913 (up to 4/5/2019 23:00)
+df_filtered = df.iloc[:114914]
+
+# Remove the first 12 hours of simulation data (12 * 684 locations per hour)
+df_filtered = df_filtered.iloc[684 * 12:]
+
+# FDA processing function to calculate the most representative curve and K-medoids
+def process_fda_with_depth_clustering(df, var_name, y_label, n_clusters=5):
+    df['HoursSinceStart'] = np.arange(len(df)) // 684  # Create a time reference
+    time_points = df['HoursSinceStart'].unique()
+    valid_time_points = time_points[:168 - 12]  # Adjust time points to match non-missing data and remove spin-up
+
+    # Convert hours to dates for the x-axis
+    start_date = pd.to_datetime('2019-03-30 12:00')  # Adjust start time by removing spin-up hours
+    date_range = pd.date_range(start=start_date, periods=len(valid_time_points), freq='H')
+
+    # Pivot the dataframe to get curves (rows for each location, columns for time)
+    curves = df.pivot(index='HoursSinceStart', columns='Location', values=var_name).values
+    curves = curves[~np.isnan(curves).any(axis=1)]  # Remove NaNs
+
+    # Convert to FDataGrid for smoothing
+    fdata = FDataGrid(curves.T, valid_time_points)  # Transpose to match time x locations
+
+    # Apply smoothing using a B-spline basis
+    basis = BSplineBasis(n_basis=10)  # Adjust the number of basis functions as needed
+    smoother = BasisSmoother(basis)
+    smoothed_data = smoother.fit_transform(fdata)
+
+    # Depth measurement (Modified Band Depth)
+    depth = ModifiedBandDepth().fit(smoothed_data).transform(smoothed_data)
+    representative_curve_idx = np.argmax(depth)  # Get the index of the curve with the highest depth
+
+    # K-medoids clustering
+    kmedoids = KMedoids(n_clusters=n_clusters, random_state=0)
+    cluster_labels = kmedoids.fit_predict(smoothed_data.data_matrix.squeeze())
+
+    # Plot the smoothed data with different colors and highlight the representative curve
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap('tab20')  # Get a colormap with 20 distinct colors
+
+    for i, curve in enumerate(smoothed_data.data_matrix):
+        color = cmap(i % cmap.N)  # Assign a unique color for each curve
+        plt.plot(date_range, curve, alpha=0.5, color=color, label=f'Location {i+1}' if i < 20 else '')
+
+    # Highlight the representative curve (highest depth)
+    plt.plot(date_range, smoothed_data.data_matrix[representative_curve_idx].flatten(), color='black', linewidth=2, label='Most Representative Curve')
+
+    # Highlight the medoids of each cluster
+    for medoid_idx in kmedoids.medoid_indices_:
+        plt.plot(date_range, smoothed_data.data_matrix[medoid_idx].flatten(), linestyle='--', linewidth=2, label=f'Cluster Medoid {medoid_idx+1}')
+
+    # Format the x-axis to show dates instead of hours
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator())
+    plt.gcf().autofmt_xdate()  # Rotate the dates for better visibility
+
+    # Plot settings
+    plt.title(f'Smoothed {y_label} Curves with Depth and Clustering Medellín W2')
+    plt.xlabel('Date')
+    plt.ylabel(y_label)
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # Adjust legend position
+    plt.tight_layout()
+    plt.show()
+
+    # Return the representative curve and medoid indices
+    return smoothed_data.data_matrix[representative_curve_idx].flatten(), [smoothed_data.data_matrix[medoid_idx].flatten() for medoid_idx in kmedoids.medoid_indices_]
+
+# Run for Temperature, WindSpeed, and WindDirection
+temp_rep_curve, temp_kmedoid_curves = process_fda_with_depth_clustering(df_filtered, 'Temperature', 'Temperature (°C)')
+ws_rep_curve, ws_kmedoid_curves = process_fda_with_depth_clustering(df_filtered, 'WindSpeed', 'Wind Speed (m/s)')
+wd_rep_curve, wd_kmedoid_curves = process_fda_with_depth_clustering(df_filtered, 'WindDirection', 'Wind Direction (°)')
+
+# Load the observation data
+obs_df = pd.read_csv('medellin2obs.csv', encoding='ISO-8859-1')
+
+# Convert the 'Time' column to datetime and adjust to UTC
+obs_df['Time'] = pd.to_datetime(obs_df['Time']) + pd.DateOffset(hours=5)
+
+def smooth_fda(data, time_points, n_basis=10):
+    if len(data.shape) == 1:
+        data = np.atleast_2d(data)
+    data_matrix = data
+    basis = BSplineBasis(n_basis=n_basis)
+    fdata = FDataGrid(data_matrix=data_matrix, grid_points=[time_points])
+    smoother = BasisSmoother(basis=basis)
+    fdata_smoothed = smoother.fit_transform(fdata)
+    return fdata_smoothed
+
+def align_data_lengths(obs_data, sim_data):
+    min_length = min(len(obs_data), len(sim_data))
+    return obs_data[:min_length], sim_data[:min_length]
+
+def compare_fda_with_observations(obs_data, sim_rep_curve, sim_kmedoid_curves, time_points, y_label):
+    obs_smoothed = smooth_fda(obs_data, time_points, n_basis=10)
+    sim_rep_curve = np.atleast_2d(sim_rep_curve).T
+    sim_kmedoid_curves = [np.atleast_2d(curve).T for curve in sim_kmedoid_curves]
+    obs_smoothed_data, sim_rep_curve_aligned = align_data_lengths(obs_smoothed.data_matrix.squeeze(), sim_rep_curve.squeeze())
+    sim_kmedoid_curves_aligned = [align_data_lengths(obs_smoothed_data, curve.squeeze())[1] for curve in sim_kmedoid_curves]
+
+    # Calculate RMSE, Pearson correlation, MFB, and L2 Norm for the most representative curve
+    rmse_rep = np.sqrt(mean_squared_error(obs_smoothed_data, sim_rep_curve_aligned))
+    pearson_corr_rep, _ = pearsonr(obs_smoothed_data, sim_rep_curve_aligned)
+    mfb_rep = 2 * np.mean((sim_rep_curve_aligned - obs_smoothed_data) / (sim_rep_curve_aligned + obs_smoothed_data))
+    l2_norm_rep = lp_distance(FDataGrid([obs_smoothed_data], [time_points[:len(obs_smoothed_data)]]), 
+                              FDataGrid([sim_rep_curve_aligned], [time_points[:len(sim_rep_curve_aligned)]]), p=2)
+
+    # Calculate metrics for each K-medoid curve
+    rmse_kmedoids = []
+    pearson_corr_kmedoids = []
+    mfb_kmedoids = []
+    l2_norm_kmedoids = []
+
+    for curve in sim_kmedoid_curves_aligned:
+        rmse = np.sqrt(mean_squared_error(obs_smoothed_data, curve))
+        pearson_corr, _ = pearsonr(obs_smoothed_data, curve)
+        mfb = 2 * np.mean((curve - obs_smoothed_data) / (curve + obs_smoothed_data))
+        l2_norm = lp_distance(FDataGrid([obs_smoothed_data], [time_points[:len(obs_smoothed_data)]]), 
+                              FDataGrid([curve], [time_points[:len(obs_smoothed_data)]]), p=2)
+        rmse_kmedoids.append(rmse)
+        pearson_corr_kmedoids.append(pearson_corr)
+        mfb_kmedoids.append(mfb)
+        l2_norm_kmedoids.append(l2_norm)
+
+    # Print the results
+    print(f"{y_label} Comparison Results:")
+    print(f"  Most Representative Curve:")
+    print(f"    RMSE: {rmse_rep}")
+    print(f"    Pearson Correlation: {pearson_corr_rep}")
+    print(f"    MFB: {mfb_rep}")
+    print(f"    L2 Norm: {l2_norm_rep}")
+
+    for i, (rmse, corr, mfb, l2_norm) in enumerate(zip(rmse_kmedoids, pearson_corr_kmedoids, mfb_kmedoids, l2_norm_kmedoids)):
+        print(f"  K-Medoid {i+1}:")
+        print(f"    RMSE: {rmse}")
+        print(f"    Pearson Correlation: {corr}")
+        print(f"    MFB: {mfb}")
+        print(f"    L2 Norm: {l2_norm}")
+
+    # Plot the curves
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_points[:len(obs_smoothed_data)], obs_smoothed_data, color='blue', label='Smoothed Observation')
+    plt.plot(time_points[:len(sim_rep_curve_aligned)], sim_rep_curve_aligned, color='black', linestyle='-', linewidth=2, label='Most Representative Curve')
+
+    for i, curve in enumerate(sim_kmedoid_curves_aligned):
+        plt.plot(time_points[:len(obs_smoothed_data)], curve, linestyle='--', linewidth=2, label=f'K-Medoid {i+1}')
+
+    plt.title(f'Comparison of Smoothed {y_label} Curves Medellín W2')
+    plt.xlabel('Day')
+    plt.ylabel(y_label)
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1)) 
+    plt.tight_layout()
+    plt.show()
+
+# Load the observation data (already loaded and processed)
+obs_temp = obs_df['Temperature_obs'].values
+obs_ws = obs_df['WindSpeed_obs'].values
+obs_wd = obs_df['WindDirection_obs'].values
+
+# Define time points for observations (assuming obs_df index is time-based)
+obs_time_points = np.arange(len(obs_df))
+
+# Ensure that the observation data is properly reshaped
+obs_temp = np.atleast_2d(obs_temp)
+obs_ws = np.atleast_2d(obs_ws)
+obs_wd = np.atleast_2d(obs_wd)
+
+# Compare for Temperature, WindSpeed, and WindDirection
+compare_fda_with_observations(obs_temp, temp_rep_curve, temp_kmedoid_curves, obs_time_points, 'Temperature (°C)')
+compare_fda_with_observations(obs_ws, ws_rep_curve, ws_kmedoid_curves, obs_time_points, 'Wind Speed (m/s)')
+compare_fda_with_observations(obs_wd, wd_rep_curve, wd_kmedoid_curves, obs_time_points, 'Wind Direction (°)')
